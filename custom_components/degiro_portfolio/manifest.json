@@ -1,0 +1,12 @@
+{
+  "domain": "degiro_portfolio",
+  "name": "Degiro Portfolio",
+  "codeowners": [],
+  "config_flow": true,
+  "documentation": "https://github.com/Timboooh/homeassistant-degiro-portfolio",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/Timboooh/homeassistant-degiro-portfolio/issues",
+  "requirements": ["degiro-connector==3.0.36"],
+  "version": "0.1.0"
+}

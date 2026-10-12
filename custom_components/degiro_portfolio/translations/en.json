@@ -1,0 +1,57 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Degiro",
+        "description": "This uses Degiro's unofficial web API with read-only requests. Your credentials are stored in Home Assistant's configuration storage.",
+        "data": {
+          "username": "Username",
+          "password": "Password",
+          "totp_secret_key": "2FA secret (TOTP)"
+        },
+        "data_description": {
+          "totp_secret_key": "The base32 secret shown when you set up your authenticator app. Required if two-factor authentication is enabled. SMS-only 2FA is not supported."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate Degiro",
+        "description": "Degiro rejected the stored credentials for {username}. Enter the current password (and 2FA secret).",
+        "data": {
+          "password": "Password",
+          "totp_secret_key": "2FA secret (TOTP)"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Degiro rejected the username, password or 2FA secret.",
+      "totp_required": "Two-factor authentication is enabled on this account. Enter the 2FA secret (TOTP).",
+      "app_approval": "Open the Degiro app and approve the login attempt, then submit again.",
+      "captcha_required": "Degiro requires a captcha. Log in once in your browser, solve it, then try again.",
+      "maintenance": "Degiro is in scheduled maintenance. Try again later.",
+      "cannot_connect": "Could not connect to Degiro.",
+      "unknown": "Unexpected error. Check the Home Assistant log."
+    },
+    "abort": {
+      "already_configured": "This Degiro account is already configured.",
+      "reauth_successful": "Re-authentication was successful."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Degiro Portfolio options",
+        "description": "Prices are fetched every interval. Degiro itself is only contacted about once a day, or when you press \"Refresh from Degiro\".",
+        "data": {
+          "update_hours": "Price refresh interval",
+          "ticker_overrides": "Yahoo ticker overrides"
+        },
+        "data_description": {
+          "ticker_overrides": "One per line, as ISIN=TICKER, for example IE00BK5BQT80=VWCE.DE. Use this when the automatically chosen Yahoo listing is wrong. Lines starting with # are ignored."
+        }
+      }
+    },
+    "error": {
+      "invalid_overrides": "Each line must look like ISIN=TICKER, for example IE00BK5BQT80=VWCE.DE."
+    }
+  }
+}
