@@ -7,6 +7,9 @@
   "integration_type": "service",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/Timboooh/homeassistant-degiro-portfolio/issues",
-  "requirements": ["degiro-connector==3.0.36"],
-  "version": "0.1.0"
+  "requirements": [
+    "degiro-connector==3.0.36",
+    "yfinance>=1.7.0"
+  ],
+  "version": "0.2.0"
 }

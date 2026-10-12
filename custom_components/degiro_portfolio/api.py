@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
-from urllib.parse import quote as url_quote
 
-import aiohttp
 import requests
+import yfinance as yf
 from degiro_connector.core.exceptions import (
     CaptchaRequiredError,
     DeGiroConnectionError,
@@ -18,6 +19,8 @@ from degiro_connector.core.exceptions import (
 from degiro_connector.trading.api import API
 from degiro_connector.trading.models.account import UpdateOption, UpdateRequest
 from degiro_connector.trading.models.credentials import Credentials
+from homeassistant.core import HomeAssistant
+from yfinance.exceptions import YFRateLimitError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -194,20 +197,20 @@ def fetch_holdings(
 
 # ------------------------------------------------------------------- Yahoo --
 
-CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-SEARCH_URL = "https://query2.finance.yahoo.com/v1/finance/search"
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json",
-}
-REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=20)
+# Yahoo answers HTTP 429 to plain HTTP clients (aiohttp/requests) on every request.
+# yfinance talks to Yahoo through curl_cffi, which presents a browser-like TLS
+# fingerprint, so that is what we use. Its own error logging duplicates ours.
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
+PACE_SECONDS = 0.3  # minimum spacing between Yahoo requests
 
 
 class YahooError(Exception):
     """A Yahoo Finance request failed or returned something unusable."""
+
+
+class YahooRateLimited(YahooError):  # noqa: N818
+    """Yahoo is throttling us; stop sending requests for a while."""
 
 
 @dataclass(frozen=True)
@@ -219,61 +222,73 @@ class Quote:
     as_of: str
 
 
+def _is_rate_limit(err: BaseException) -> bool:
+    text = str(err).lower()
+    return (
+        isinstance(err, YFRateLimitError)
+        or "too many requests" in text
+        or "rate limit" in text
+        or "429" in text
+    )
+
+
+def _quote_sync(symbol: str) -> Quote:
+    """Blocking: latest close for a Yahoo symbol, in major currency units."""
+    try:
+        ticker = yf.Ticker(symbol)
+        history = ticker.history(period="5d", auto_adjust=False)
+        closes = history["Close"].dropna()
+        if closes.empty:
+            raise YahooError(f"{symbol}: no price data")
+        currency = (ticker.history_metadata or {}).get("currency")
+        price = float(closes.iloc[-1])
+        as_of = closes.index[-1].date().isoformat()
+    except YahooError:
+        raise
+    except Exception as err:  # noqa: BLE001 - yfinance raises many unrelated types
+        if _is_rate_limit(err):
+            raise YahooRateLimited(f"{symbol}: Yahoo rate limit") from err
+        raise YahooError(f"{symbol}: {err}") from err
+    if not currency:
+        raise YahooError(f"{symbol}: no currency in Yahoo response")
+    major, divisor = normalize_currency(currency)
+    return Quote(price / divisor, str(major), as_of)
+
+
+def _search_sync(query: str) -> list[dict]:
+    """Blocking: Yahoo symbol search (works with ISINs)."""
+    try:
+        return list(yf.Search(query, max_results=10, news_count=0, lists_count=0).quotes)
+    except Exception as err:  # noqa: BLE001
+        if _is_rate_limit(err):
+            raise YahooRateLimited(f"search {query}: Yahoo rate limit") from err
+        raise YahooError(f"search {query}: {err}") from err
+
+
 class YahooClient:
-    """Minimal async client for Yahoo Finance's public chart/search endpoints."""
+    """Async wrapper around yfinance with request pacing."""
 
-    def __init__(self, session: aiohttp.ClientSession) -> None:
-        self._session = session
+    def __init__(self, hass: HomeAssistant) -> None:
+        self._hass = hass
+        self._lock = asyncio.Lock()
+        self._last = 0.0
+        # Set by the coordinator when Yahoo rate-limits us. Lives here (not on the
+        # coordinator) because a failed setup is retried with a brand-new coordinator.
+        self.cooldown_until: datetime | None = None
 
-    async def _get_json(self, url: str, params: dict[str, Any]) -> dict:
-        try:
-            async with self._session.get(
-                url, params=params, headers=HEADERS, timeout=REQUEST_TIMEOUT
-            ) as resp:
-                if resp.status == 429:
-                    raise YahooError("Yahoo rate limit (HTTP 429)")
-                if resp.status != 200:
-                    raise YahooError(f"Yahoo returned HTTP {resp.status}")
-                return await resp.json(content_type=None)
-        except (aiohttp.ClientError, TimeoutError, ValueError) as err:
-            raise YahooError(f"Yahoo request failed: {err}") from err
+    async def _pace(self) -> None:
+        async with self._lock:
+            wait = self._last + PACE_SECONDS - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last = time.monotonic()
 
     async def quote(self, symbol: str) -> Quote:
         """Return the latest price for a Yahoo symbol."""
-        data = await self._get_json(
-            CHART_URL.format(symbol=url_quote(symbol, safe="")),
-            {"range": "5d", "interval": "1d"},
-        )
-        chart = data.get("chart") or {}
-        if chart.get("error"):
-            raise YahooError(f"{symbol}: {chart['error'].get('description', 'error')}")
-        results = chart.get("result") or []
-        if not results:
-            raise YahooError(f"{symbol}: no data")
-
-        result = results[0]
-        meta = result.get("meta") or {}
-        price = meta.get("regularMarketPrice")
-        if price is None:
-            closes = (
-                ((result.get("indicators") or {}).get("quote") or [{}])[0].get("close")
-                or []
-            )
-            closes = [c for c in closes if c is not None]
-            price = closes[-1] if closes else None
-        currency = meta.get("currency")
-        if price is None or not currency:
-            raise YahooError(f"{symbol}: no price or currency")
-
-        major, divisor = normalize_currency(currency)
-        ts = meta.get("regularMarketTime")
-        as_of = datetime.fromtimestamp(ts, UTC).date().isoformat() if ts else ""
-        return Quote(float(price) / divisor, str(major), as_of)
+        await self._pace()
+        return await self._hass.async_add_executor_job(_quote_sync, symbol)
 
     async def search(self, query: str) -> list[dict]:
-        """Search Yahoo (works with ISINs); returns the raw quote dicts."""
-        data = await self._get_json(
-            SEARCH_URL,
-            {"q": query, "quotesCount": 10, "newsCount": 0, "listsCount": 0},
-        )
-        return data.get("quotes") or []
+        """Search Yahoo; returns the raw quote dicts."""
+        await self._pace()
+        return await self._hass.async_add_executor_job(_search_sync, query)

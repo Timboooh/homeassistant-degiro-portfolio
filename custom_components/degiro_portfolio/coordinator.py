@@ -12,7 +12,6 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
@@ -22,6 +21,7 @@ from .api import (
     DegiroError,
     YahooClient,
     YahooError,
+    YahooRateLimited,
     fetch_holdings,
     normalize_currency,
 )
@@ -44,6 +44,10 @@ _LOGGER = logging.getLogger(__name__)
 
 ISIN_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$")
 MAX_SEARCH_CANDIDATES = 6
+# After Yahoo rate-limits us, send no requests for this long.
+YAHOO_COOLDOWN = timedelta(minutes=15)
+# While we can only show old prices, try again this often.
+DEGRADED_INTERVAL = timedelta(minutes=30)
 
 
 def parse_ticker_overrides(text: str) -> dict[str, str]:
@@ -76,6 +80,46 @@ class PortfolioData:
     updated_at: datetime
     holdings_updated_at: datetime | None
     fallback_positions: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "total": self.total,
+            "investments": self.investments,
+            "cash": self.cash,
+            "positions": self.positions,
+            "updated_at": self.updated_at.isoformat(),
+            "holdings_updated_at": (
+                self.holdings_updated_at.isoformat() if self.holdings_updated_at else None
+            ),
+            "fallback_positions": self.fallback_positions,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> PortfolioData | None:
+        """Rebuild from storage; None if the stored data is unusable."""
+        try:
+            updated_at = dt_util.parse_datetime(data["updated_at"])
+            if updated_at is None:
+                return None
+            return cls(
+                total=float(data["total"]),
+                investments=float(data["investments"]),
+                cash=float(data["cash"]),
+                positions=list(data["positions"]),
+                updated_at=updated_at,
+                holdings_updated_at=dt_util.parse_datetime(data.get("holdings_updated_at") or ""),
+                fallback_positions=list(data.get("fallback_positions", [])),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+
+def _shared_yahoo(hass: HomeAssistant) -> YahooClient:
+    """One client (and one rate-limit cooldown) for all coordinators and retries."""
+    store = hass.data.setdefault(DOMAIN, {})
+    if "yahoo" not in store:
+        store["yahoo"] = YahooClient(hass)
+    return store["yahoo"]
 
 
 class _Fx:
@@ -112,7 +156,8 @@ class DegiroPortfolioCoordinator(DataUpdateCoordinator[PortfolioData]):
             hass, STORE_VERSION, f"{DOMAIN}.{entry.entry_id}"
         )
         self._stored: dict[str, Any] = {}
-        self._yahoo = YahooClient(async_get_clientsession(hass))
+        self._yahoo = _shared_yahoo(hass)
+        self._normal_interval = timedelta(hours=hours)
         self._force_holdings = False
         self._auth_failed = False
         self._degiro_retry_at: datetime | None = None
@@ -230,6 +275,8 @@ class DegiroPortfolioCoordinator(DataUpdateCoordinator[PortfolioData]):
             tried += 1
             try:
                 quote = await self._yahoo.quote(symbol)
+            except YahooRateLimited:
+                raise
             except YahooError:
                 continue
             score = 2 * (quote.currency == want_ccy) + (
@@ -271,30 +318,36 @@ class DegiroPortfolioCoordinator(DataUpdateCoordinator[PortfolioData]):
         )
         return symbol
 
+    @staticmethod
+    def _fallback_position(pos: dict[str, Any]) -> dict[str, Any]:
+        """A position valued at Degiro's own figure (no Yahoo price)."""
+        degiro_value = pos.get("degiro_value")
+        return {
+            "name": pos.get("name"),
+            "isin": pos.get("isin"),
+            "qty": pos.get("qty") or 0,
+            "ticker": None,
+            "price": None,
+            "price_currency": None,
+            "price_date": None,
+            "value_eur": round(float(degiro_value), 2) if degiro_value is not None else 0.0,
+            "source": "degiro_fallback",
+        }
+
     async def _value_position(
         self, pos: dict[str, Any], overrides: dict[str, str], fx: _Fx
     ) -> dict[str, Any]:
         qty = pos.get("qty") or 0
         degiro_value = pos.get("degiro_value")
-        out: dict[str, Any] = {
-            "name": pos.get("name"),
-            "isin": pos.get("isin"),
-            "qty": qty,
-            "ticker": None,
-            "price": None,
-            "price_currency": None,
-            "price_date": None,
-            "value_eur": 0.0,
-            "source": "degiro_fallback",
-        }
+        out = self._fallback_position(pos)
         try:
             symbol = await self._resolve_ticker(pos, overrides)
             quote = await self._yahoo.quote(symbol)
             value = qty * quote.price * await fx.to_eur(quote.currency)
+        except YahooRateLimited:
+            raise
         except YahooError as err:
             _LOGGER.warning("%s: price lookup failed (%s)", pos.get("name"), err)
-            if degiro_value is not None:
-                out["value_eur"] = round(float(degiro_value), 2)
             return out
 
         out.update(
@@ -320,6 +373,31 @@ class DegiroPortfolioCoordinator(DataUpdateCoordinator[PortfolioData]):
 
     # -------------------------------------------------------------- update --
 
+    async def _async_price_positions(
+        self, now: datetime, holdings: dict[str, Any], overrides: dict[str, str]
+    ) -> list[dict[str, Any]]:
+        """Price every position; stop contacting Yahoo as soon as it rate-limits."""
+        limited = (
+            self._yahoo.cooldown_until is not None and now < self._yahoo.cooldown_until
+        )
+        fx = _Fx(self._yahoo)
+        positions: list[dict[str, Any]] = []
+        for pos in holdings.get("positions", []):
+            if limited:
+                positions.append(self._fallback_position(pos))
+                continue
+            try:
+                positions.append(await self._value_position(pos, overrides, fx))
+            except YahooRateLimited:
+                limited = True
+                self._yahoo.cooldown_until = now + YAHOO_COOLDOWN
+                _LOGGER.warning(
+                    "Yahoo is rate limiting requests; pausing price lookups for %d minutes",
+                    YAHOO_COOLDOWN.total_seconds() // 60,
+                )
+                positions.append(self._fallback_position(pos))
+        return positions
+
     async def _async_update_data(self) -> PortfolioData:
         now = dt_util.utcnow()
         holdings, holdings_at = await self._async_get_holdings(now)
@@ -333,34 +411,42 @@ class DegiroPortfolioCoordinator(DataUpdateCoordinator[PortfolioData]):
             overrides = {}
 
         tickers_before = dict(self._stored.get("tickers", {}))
-        fx = _Fx(self._yahoo)
-        positions = [
-            await self._value_position(pos, overrides, fx)
-            for pos in holdings.get("positions", [])
-        ]
-
-        if self._stored.get("tickers", {}) != tickers_before:
-            await self._store.async_save(self._stored)
+        positions = await self._async_price_positions(now, holdings, overrides)
 
         if positions and not any(p["source"] == "yahoo" for p in positions):
-            # Home Assistant only notifies entities on the first failure in a row;
-            # push a state write ourselves so the `stale` attribute keeps ageing.
-            self.async_update_listeners()
+            # Nothing could be priced. Prefer showing the last good values (flagged
+            # `stale` once they age) over making the sensors unavailable.
+            previous = self.data or PortfolioData.from_dict(
+                self._stored.get("last_data") or {}
+            )
+            if self._stored.get("tickers", {}) != tickers_before:
+                await self._store.async_save(self._stored)
+            if previous is not None:
+                _LOGGER.warning(
+                    "No Yahoo prices available; keeping the values from %s and "
+                    "retrying in %d minutes",
+                    previous.updated_at,
+                    DEGRADED_INTERVAL.total_seconds() // 60,
+                )
+                self.update_interval = DEGRADED_INTERVAL
+                return previous
             raise UpdateFailed(
                 "Could not get a price from Yahoo Finance for any position",
                 retry_after=RETRY_AFTER_SECONDS,
             )
 
+        self.update_interval = self._normal_interval
         investments = round(sum(p["value_eur"] for p in positions), 2)
         cash = round(float(holdings.get("cash") or 0), 2)
-        return PortfolioData(
+        data = PortfolioData(
             total=round(investments + cash, 2),
             investments=investments,
             cash=cash,
             positions=positions,
             updated_at=now,
             holdings_updated_at=holdings_at,
-            fallback_positions=[
-                p["name"] for p in positions if p["source"] != "yahoo"
-            ],
+            fallback_positions=[p["name"] for p in positions if p["source"] != "yahoo"],
         )
+        self._stored["last_data"] = data.to_dict()
+        await self._store.async_save(self._stored)
+        return data
